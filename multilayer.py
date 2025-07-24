@@ -7,6 +7,12 @@ from typing import Dict, List, Tuple, Optional
 from geometry import process_point_cloud, create_uv_rgb_grid
 from decode_ply import decode_with_metadata,evaluate_quality
 import math
+from compression import ImageCompressor
+import shutil
+from gaussian_model import GaussianModel
+from sklearn.neighbors import NearestNeighbors
+from scipy.spatial.distance import pdist
+from density import PointCloudDensityController
 
 def find_unused_points(original_pcd, mesh_vertices):
     """
@@ -115,7 +121,7 @@ def multilayer_encode(input_pcd: o3d.geometry.PointCloud,
     current_pcd = input_pcd
     iteration = 0
     layer_count = 0
-    
+
 
     initial_point_count = len(input_pcd.points)
     
@@ -123,22 +129,28 @@ def multilayer_encode(input_pcd: o3d.geometry.PointCloud,
     min_remaining_points = max(10, int(initial_point_count * 0.001))  # 至少10个点或初始点数的0.1%
     
     while len(current_pcd.points) > 0 and iteration < max_iterations and layer_count < max_layers:
+
         iteration += 1
         layer_count += 1
         
         print(f"\n第 {iteration} 轮迭代 (Layer {layer_count})")
-        print(f"当前点数: {len(current_pcd.points)}")
-        print(f"剩余点数占比: {len(current_pcd.points)/initial_point_count:.2%}")
-        
+        filtered_pcd = current_pcd
+        if layer_count < 4:
+            pd_controller = PointCloudDensityController(grid_size=0.2,
+                                                        k_neighbors=15,
+                                                        density_threshold=1,
+                                                        preserve_ratio=0.33 * layer_count)
+            filtered_pcd,_ = pd_controller.adaptive_density_control(current_pcd.points)
+        print(f"当前处理点数: {len(filtered_pcd.points)}")
+        ratio = math.log10(3 * iteration) + 1
+        print(f"当前size: {int(grid_size/int(ratio))}")
         # 第一步：点云处理（BPA重建）
-        current_layer_init = process_point_cloud(current_pcd, output_dir, ball_radius=radius, visualization=visualize)
+        current_layer_init = process_point_cloud(filtered_pcd, output_dir,image_size=int(grid_size/int(ratio)), ball_radius=radius, visualization=visualize)
 
         if len(current_layer_init["vertices"]) == 0:
             print("没有顶点参与重建，结束迭代")
             break
         # 第二步：网格处理
-        ratio = math.log10(5 * iteration) + 1
-        print(f"当前size: {int(grid_size/int(ratio))}")
         current_layer, unused = create_uv_rgb_grid(current_layer_init["vertices"], current_layer_init["uv_coords"],
                                                     image_size=int(grid_size/int(ratio)), output_path=os.path.join(output_dir, f"uv_rgb_texture_layer_{layer_count}.png"), output_metadata=os.path.join(output_dir, f"uv_rgb_texture_layer_{layer_count}_metadata.json"))
         layer_dict = find_unused_points(current_pcd, current_layer)
@@ -148,7 +160,7 @@ def multilayer_encode(input_pcd: o3d.geometry.PointCloud,
         unprocessed_points = layer_dict['unused_points']
 
         if len(unprocessed_points) > 0:
-            radius = radius + 0.15  # 每轮迭代增大半径
+            radius = radius + 0.003  # 每轮迭代增大半径
             current_pcd = o3d.geometry.PointCloud()
             current_pcd.points = o3d.utility.Vector3dVector(unprocessed_points)
             
@@ -186,18 +198,18 @@ def multilayer_encode(input_pcd: o3d.geometry.PointCloud,
     print(f"全程参与重建的点数: {len(fully_used_points)}")
 
     # 可选：将全程参与重建的点集保存为点云文件
-    fully_used_pcd = o3d.geometry.PointCloud()
-    fully_used_pcd.points = o3d.utility.Vector3dVector(fully_used_points)
+    used_pcd = o3d.geometry.PointCloud()
+    used_pcd.points = o3d.utility.Vector3dVector(fully_used_points)
 
     print(f"\n迭代处理完成，总轮次: {iteration}, 总层数: {layer_count}")
     print(f"剩余未处理点数: {len(current_pcd.points) if len(current_pcd.points) > 0 else 0}")
     
     return {
-        "total_iterations": iteration, 
         "total_layers": layer_count,
         "initial_point_count": initial_point_count,
         "remaining_points": len(current_pcd.points) if len(current_pcd.points) > 0 else 0,
-        "final_unprocessed_pcd": current_pcd if len(current_pcd.points) > 0 else None
+        "final_unprocessed_pcd": current_pcd if len(current_pcd.points) > 0 else None,
+        "points_in_layer": used_pcd.points if len(used_pcd.points) > 0 else None,
     }
 
 def multilayer_deocde(output_dir, layer_count):
@@ -210,7 +222,7 @@ def multilayer_deocde(output_dir, layer_count):
     layer_info = []
     
     for layer_idx in range(1, layer_count + 1):
-        image_path = os.path.join(output_dir, f"uv_rgb_texture_layer_{layer_idx}.png")
+        image_path = os.path.join(output_dir, f"uv_rgb_texture_layer_{layer_idx}.jpeg")
         metadata_path = os.path.join(output_dir, f"uv_rgb_texture_layer_{layer_idx}_metadata.json")
         
         if not os.path.exists(image_path):
@@ -246,26 +258,77 @@ def multilayer_deocde(output_dir, layer_count):
     
     return merged_points, layer_info
 
+def calculate_nearest_neighbor_distances(points):
+    """
+    计算每个点到其最近邻点的距离，并返回最大和最小的最近邻距离
+    """
+    if len(points) < 2:
+        return 0, 0
+    
+    # 使用KNN找到每个点的最近邻（k=2，因为第一个邻居是自己）
+    knn = NearestNeighbors(n_neighbors=2)
+    knn.fit(points)
+    
+    # 获取每个点到其最近邻的距离
+    distances, indices = knn.kneighbors(points)
+    
+    # distances[:, 0] 是到自己的距离（为0）
+    # distances[:, 1] 是到最近邻的距离
+    nearest_distances = distances[:, 1]
+    
+    min_nearest_distance = np.min(nearest_distances)
+    max_nearest_distance = np.max(nearest_distances)
+    
+    return min_nearest_distance, max_nearest_distance
 
 def main():
     parser = argparse.ArgumentParser(description="点云迭代处理工具")
     parser.add_argument("--input", "-i", help="输入点云文件路径（可选，默认使用bunny数据集）")
     parser.add_argument("--output", "-o", default="output", help="输出目录")
-    parser.add_argument("--radius", "-r", type=float, default=0.01, help="Ball Pivoting球半径")
+    parser.add_argument("--radius", "-r", type=float, default=0.005, help="Ball Pivoting球半径")
     parser.add_argument("--grid-size", "-g", type=int, default=512, help="网格大小")
     parser.add_argument("--max-iterations", "-m", type=int, default=10, help="最大迭代次数")
     parser.add_argument("--max-layers", "-l", type=int, default=10, help="最大层数限制")
     parser.add_argument("--visualize", "-v", action="store_true", help="是否显示3D可视化结果")
+    parser.add_argument("--sh", "-s", type=int, default=3, help="球谐函数")
     
     args = parser.parse_args()
     # 创建输出目录
     if not os.path.exists(args.output):
         os.makedirs(args.output)
     
-    # 加载点云数据
+    # 加载高斯数据
     if args.input:
         print(f"加载点云文件: {args.input}")
-        pcd = o3d.io.read_point_cloud(args.input)
+        gaussian = GaussianModel(args.sh)
+        gaussian.load_ply(args.input)
+        xyz = gaussian._xyz
+        if hasattr(xyz, "detach"):  # 判断是否为torch.Tensor
+            xyz = xyz.detach().cpu().numpy()
+        print(f"点云包含 {len(xyz)} 个点")
+        # knn = NearestNeighbors(n_neighbors=12)
+        # knn.fit(xyz)
+
+        # # Find the distances and indices of the neighbors for each point
+        # distances, indices = knn.kneighbors(xyz)
+
+        # # Determine a threshold to identify pcd1 that are part of the body
+        # # This threshold will depend on your specific data
+        # distance_threshold = np.mean(distances) + 0.8 * np.std(distances)
+
+        # # Filter points
+        # index = np.mean(distances, axis=1) < distance_threshold
+        # filtered_points = xyz[index]
+        print(calculate_nearest_neighbor_distances(xyz))
+
+
+        
+        # new_attributes = []
+        # for attr in attributes:
+        #     new_attributes.append(attr[index])
+        # 转换为 open3d 点云对象
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(xyz)
     else:
         print("使用bunny数据集作为示例")
         bunny = o3d.data.BunnyMesh()
@@ -303,23 +366,54 @@ def main():
     stats_path = os.path.join(args.output, "processing_stats.txt")
     with open(stats_path, 'w') as f:
         f.write(f"总处理时间: {processing_time:.2f} 秒\n")
-        f.write(f"总迭代轮次: {results['total_iterations']}\n")
         f.write(f"总层数: {results['total_layers']}\n")
         f.write(f"初始点数: {results['initial_point_count']}\n")
         f.write(f"剩余未处理点数: {results['remaining_points']}\n")
     
     print(f"结果已保存到: {args.output}")
-
+    print("\n=== 开始压缩阶段 ===")
+    # 压缩图像
+    compressor = ImageCompressor()
+    compressor.batch_compress(args.output, args.output)
     print("\n=== 开始解码阶段 ===")
     
-    # 解码多层点云
-    decoded_points, layer_info = multilayer_deocde(args.output, results['total_layers'])
+    # 遍历output下的所有子文件夹，对每个子文件夹中的图像分别进行解码和评估
+    for subdir in os.listdir(args.output):
+        subdir_path = os.path.join(args.output, subdir)
+        if os.path.isdir(subdir_path):
+            print(f"\n处理子文件夹: {subdir_path}")
+            # 假设每个子文件夹都包含多层数据，尝试找到最大层数
+            max_layer = 0
+            for fname in os.listdir(subdir_path):
+                if fname.startswith("uv_rgb_texture_layer_") and fname.endswith(".jpeg"):
+                    try:
+                        layer_num = int(fname.split("_")[-1].split(".")[0])
+                        # 检查是否存在对应的元数据文件，如果没有则尝试转移/复制
+                        meta_candidate = fname.replace(".jpeg", "_metadata.json")
+                        meta_path = os.path.join(subdir_path, meta_candidate)
+                        if not os.path.exists(meta_path):
+                            # 尝试从主output目录转移元数据
+                            src_meta = os.path.join(args.output, meta_candidate)
+                            if os.path.exists(src_meta):
+                                shutil.copy(src_meta, meta_path)
+                                print(f"已转移元数据: {src_meta} -> {meta_path}")
+                        if layer_num > max_layer:
+                            max_layer = layer_num
+                    except Exception:
+                        continue
+            if max_layer == 0:
+                print(f"{subdir_path} 未找到有效的层数据，跳过。")
+                continue
 
-    # === 评估阶段 ===
-    print("\n=== 开始评估阶段 ===")
-    
-    # 评估重建质量
-    evaluation_results = evaluate_quality(pcd.points, decoded_points)
+            # 解码
+            decoded_points, layer_info = multilayer_deocde(subdir_path, max_layer)
+
+            # 评估
+            print("\n=== 开始评估阶段 ===")
+            # 这里假设原始点云为results["points_in_layer"]，可根据实际情况调整
+            evaluation_results = evaluate_quality(results["points_in_layer"], decoded_points)
+            print(f"评估结果: {evaluation_results}")
+
 
 
 

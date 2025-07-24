@@ -8,7 +8,6 @@ import argparse
 import matplotlib.pyplot as plt
 import matplotlib.tri as tri
 from scipy.sparse import csr_matrix
-from scipy.sparse.csgraph import shortest_path
 from collections import defaultdict
 from PIL import Image, ImageDraw
 from scipy.sparse import csr_matrix, diags
@@ -19,7 +18,9 @@ import warnings
 from scipy.interpolate import griddata
 from scipy.spatial import Delaunay
 from collections import Counter
-
+from sklearn.decomposition import PCA
+from typing import List, Tuple, Optional, Set
+from sklearn.neighbors import NearestNeighbors
 
 
 
@@ -112,119 +113,8 @@ def alpha_shape_3d(pcd, alpha):
     
     return mesh
 
-
-def _build_laplacian_matrix(vertices, faces):
-    """构建拉普拉斯矩阵和面积权重"""
-    n_vertices = len(vertices)
-    n_faces = len(faces)
+def _initialize_conformal(vertices, faces):
     
-    # 计算每个面的面积
-    face_areas = []
-    for face in faces:
-        v0, v1, v2 = vertices[face]
-        edge1 = v1 - v0
-        edge2 = v2 - v0
-        area = 0.5 * np.linalg.norm(np.cross(edge1, edge2))
-        face_areas.append(area)
-    
-    face_areas = np.array(face_areas)
-    
-    # 构建拉普拉斯矩阵 (cotangent weights)
-    row_indices = []
-    col_indices = []
-    data = []
-    
-    for f_idx, face in enumerate(faces):
-        v0, v1, v2 = face
-        
-        # 计算cotangent权重
-        p0, p1, p2 = vertices[face]
-        
-        # 边向量
-        e0 = p1 - p2  # 对面顶点v0的边
-        e1 = p2 - p0  # 对面顶点v1的边  
-        e2 = p0 - p1  # 对面顶点v2的边
-        
-        # 计算cotangent值
-        def safe_cotangent(a, b):
-            cos_angle = np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-10)
-            cos_angle = np.clip(cos_angle, -1.0, 1.0)
-            sin_angle = np.sqrt(1 - cos_angle**2 + 1e-10)
-            return cos_angle / sin_angle
-        
-        cot0 = safe_cotangent(-e1, -e2)  # 顶点v0处的cotangent
-        cot1 = safe_cotangent(-e2, -e0)  # 顶点v1处的cotangent
-        cot2 = safe_cotangent(-e0, -e1)  # 顶点v2处的cotangent
-        
-        # 添加边权重
-        # 边 v1-v2
-        row_indices.extend([v1, v2])
-        col_indices.extend([v2, v1])
-        data.extend([cot0, cot0])
-        
-        # 边 v2-v0
-        row_indices.extend([v2, v0])
-        col_indices.extend([v0, v2])
-        data.extend([cot1, cot1])
-        
-        # 边 v0-v1
-        row_indices.extend([v0, v1])
-        col_indices.extend([v1, v0])
-        data.extend([cot2, cot2])
-    
-    # 构建稀疏矩阵
-    L = csr_matrix((data, (row_indices, col_indices)), shape=(n_vertices, n_vertices))
-    
-    # 计算对角线元素（每行和为0）
-    diagonal = np.array(L.sum(axis=1)).flatten()
-    L.setdiag(-diagonal)
-    
-    return L, face_areas
-
-def _compute_optimal_rotations(vertices, faces, uv_coords, face_areas):
-    """计算每个面的最优旋转矩阵"""
-    n_faces = len(faces)
-    rotations = []
-    
-    for f_idx, face in enumerate(faces):
-        v0, v1, v2 = face
-        
-        # 3D坐标
-        p0, p1, p2 = vertices[face]
-        P = np.array([p1 - p0, p2 - p0]).T  # 2x3
-        
-        # 2D UV坐标
-        uv0, uv1, uv2 = uv_coords[face]
-        Q = np.array([uv1 - uv0, uv2 - uv0]).T  # 2x2
-        
-        # 计算协方差矩阵
-        try:
-            # 使用Moore-Penrose伪逆
-            P_pinv = np.linalg.pinv(P)
-            S = Q @ P_pinv  # 2x3
-            
-            # 提取2x2子矩阵进行SVD
-            S_2x2 = S[:, :2]
-            
-            # SVD分解获得最优旋转
-            U, _, Vt = np.linalg.svd(S_2x2)
-            R = U @ Vt
-            
-            # 确保是旋转矩阵（行列式为1）
-            if np.linalg.det(R) < 0:
-                U[:, -1] *= -1
-                R = U @ Vt
-                
-        except np.linalg.LinAlgError:
-            # 如果SVD失败，使用单位矩阵
-            R = np.eye(2)
-        
-        rotations.append(R)
-    
-    return rotations
-
-def _initialize_closed_mesh_conformal(vertices, faces):
-    """改进的闭合mesh初始化"""
     n_vertices = len(vertices)
     
     # 使用更稳健的球面参数化初始化
@@ -268,150 +158,566 @@ def _initialize_closed_mesh_conformal(vertices, faces):
     
     return uv_coords
 
-def _solve_global_step_closed_mesh(L, faces, rotations, face_areas, vertices, uv_coords):
-    """求解闭合mesh的全局步骤线性系统"""
-    n_vertices = L.shape[0]
+def _initialize_conformal(vertices,faces):
+    """更稳健的立体投影"""
+    centroid = np.mean(vertices, axis=0)
+    centered_vertices = vertices - centroid
     
-    # 构建右端项
+    # 使用PCA找到主方向
+    pca = PCA(n_components=3)
+    pca.fit(centered_vertices)
+    
+    # 将数据投影到PCA空间
+    transformed = pca.transform(centered_vertices)
+    
+    # 投影到单位球面
+    norms = np.linalg.norm(transformed, axis=1)
+    norms = np.maximum(norms, 1e-10)
+    normalized_vertices = transformed / norms[:, np.newaxis]
+    
+    # 改进的立体投影 - 使用适应性投影点
+    z_coords = normalized_vertices[:, 2]
+    
+    # 动态选择投影点以减少聚集
+    z_median = np.median(z_coords)
+    projection_point = -np.sign(z_median) * 0.9  # 适应性投影点
+    
+    denominator = 1 - projection_point * z_coords
+    denominator = np.maximum(np.abs(denominator), 0.01)
+    
+    uv_coords = np.zeros((len(vertices), 2))
+    uv_coords[:, 0] = normalized_vertices[:, 0] / denominator
+    uv_coords[:, 1] = normalized_vertices[:, 1] / denominator
+    
+    # 使用更宽松的限制
+    scale_factor = np.percentile(np.abs(uv_coords), 95)
+    if scale_factor > 0:
+        uv_coords = uv_coords / scale_factor * 2
+    
+    return uv_coords
+
+def _build_laplacian_matrix(vertices, faces):
+    """构建拉普拉斯矩阵 - 快速版本"""
+    n_vertices = len(vertices)
+    
+    # 使用混合权重：余切权重 + 均匀权重
+    edges = {}
+    face_areas = []
+    
+    for face in faces:
+        v0, v1, v2 = vertices[face]
+        
+        # 计算面积
+        cross = np.cross(v1 - v0, v2 - v0)
+        area = 0.5 * np.linalg.norm(cross)
+        area = max(area, 1e-12)  # 防止零面积
+        face_areas.append(area)
+        
+        # 计算边长
+        edges_in_face = [
+            (face[0], face[1], np.linalg.norm(v1 - v0)),
+            (face[1], face[2], np.linalg.norm(v2 - v1)),
+            (face[2], face[0], np.linalg.norm(v0 - v2))
+        ]
+        
+        # 计算余切权重但增加数值保护
+        for i, (vi, vj, edge_len) in enumerate(edges_in_face):
+            if edge_len < 1e-12:
+                continue
+                
+            # 对角顶点
+            vk = face[(i+2) % 3]
+            opposite_vertex = vertices[vk]
+            
+            # 计算角度
+            vec1 = vertices[vi] - opposite_vertex
+            vec2 = vertices[vj] - opposite_vertex
+            
+            len1 = np.linalg.norm(vec1)
+            len2 = np.linalg.norm(vec2)
+            
+            if len1 < 1e-12 or len2 < 1e-12:
+                weight = 1.0 / edge_len  # 退化到均匀权重
+            else:
+                cos_angle = np.dot(vec1, vec2) / (len1 * len2)
+                cos_angle = np.clip(cos_angle, -0.999, 0.999)
+                
+                sin_angle = np.sqrt(1 - cos_angle**2)
+                if sin_angle < 1e-6:
+                    weight = 1.0 / edge_len
+                else:
+                    cot_weight = cos_angle / sin_angle
+                    # 限制余切权重的范围
+                    cot_weight = np.clip(cot_weight, -10, 10)
+                    
+                    
+                    uniform_weight = 1.0 / edge_len
+                    beta = 1e-10
+                    weight = (1-beta) * abs(cot_weight) + beta * uniform_weight
+
+            edge_key = tuple(sorted([vi, vj]))
+            edges[edge_key] = edges.get(edge_key, 0) + weight
+    
+    # 构建矩阵
+    row_indices = []
+    col_indices = []
+    data = []
+    
+    for (vi, vj), weight in edges.items():
+        # 确保权重为正且有限
+        weight = max(abs(weight), 1e-8)
+        if not np.isfinite(weight):
+            weight = 1e-8
+        
+        row_indices.extend([vi, vj])
+        col_indices.extend([vj, vi])
+        data.extend([weight, weight])
+    
+    L = csr_matrix((data, (row_indices, col_indices)), shape=(n_vertices, n_vertices))
+    
+    # 设置对角线并添加正则化
+    diagonal = np.array(L.sum(axis=1)).flatten()
+    regularization = 1e-8
+    L.setdiag(-diagonal - regularization)
+    
+    return L, np.array(face_areas)
+
+def _compute_optimal_rotations(vertices, faces, uv_coords, face_areas):
+    """计算最优旋转 - 快速版本"""
+    rotations = []
+    
+    for face in faces:
+        v0, v1, v2 = face
+        
+        # 3D局部坐标
+        P = np.array([vertices[v1] - vertices[v0], vertices[v2] - vertices[v0]]).T
+        # 2D局部坐标
+        Q = np.array([uv_coords[v1] - uv_coords[v0], uv_coords[v2] - uv_coords[v0]]).T
+        
+        try:
+            # 简化的旋转计算
+            S = Q @ np.linalg.pinv(P)
+            U, _, Vt = np.linalg.svd(S[:, :2])
+            R = U @ Vt
+            
+            # 确保det(R) > 0
+            if np.linalg.det(R) < 0:
+                U[:, -1] *= -1
+                R = U @ Vt
+            
+            rotations.append(R)
+        except:
+            rotations.append(np.eye(2))
+    
+    return rotations
+
+def _solve_global_step(L, faces, rotations, face_areas, vertices, uv_coords):
+    """快速全局步骤求解"""
+    n_vertices = L.shape[0]
     b = np.zeros((n_vertices, 2))
     
+    # 构建右端项
     for f_idx, face in enumerate(faces):
         R = rotations[f_idx]
         area = face_areas[f_idx]
         
-        # 获取3D坐标
         p0, p1, p2 = vertices[face]
         local_3d = np.array([p1 - p0, p2 - p0])
+        rotated_2d = R @ local_3d[:, :2].T
         
-        # 应用旋转到3D坐标的前两个分量
-        local_3d_2d = local_3d[:, :2].T  # 2x2
-        rotated_2d = R @ local_3d_2d  # 2x2
-        
-        # 为每个顶点添加贡献
-        weight = area * 0.5  # 面积权重
-        
+        weight = area * 0.5
         b[face[0]] += weight * (-rotated_2d[0, :] - rotated_2d[1, :])
         b[face[1]] += weight * rotated_2d[0, :]
         b[face[2]] += weight * rotated_2d[1, :]
     
-    # 固定质心以避免平移自由度
-    centroid = np.mean(uv_coords, axis=0)
-    
-    # 构建约束：所有顶点的质心保持不变
-    constraint_matrix = np.ones((1, n_vertices)) / n_vertices
-    
-    # 使用拉格朗日乘数法求解约束优化问题
-    # 构建增广系统
-    # [L   A^T] [x]   [b]
-    # [A    0 ] [λ] = [c]
-    
-    A = csr_matrix(constraint_matrix)
-    zero_block = csr_matrix((1, 1))
-    
-    # 构建块矩阵
-    top_block = sp.hstack([L, A.T])
-    bottom_block = sp.hstack([A, zero_block])
-    augmented_matrix = sp.vstack([top_block, bottom_block])
-    
+    # 简单固定第一个顶点求解
     new_uv_coords = uv_coords.copy()
     
     for dim in range(2):
-        # 构建右端向量
-        augmented_b = np.zeros(n_vertices + 1)
-        augmented_b[:n_vertices] = b[:, dim]
-        augmented_b[n_vertices] = centroid[dim]
-        
         try:
-            solution = spsolve(augmented_matrix, augmented_b)
-            new_uv_coords[:, dim] = solution[:n_vertices]
-        except Exception as e:
-            print(f"约束系统求解失败 (dim={dim}): {e}")
-            # 如果求解失败，使用简化的方法
-            try:
-                # 固定第一个顶点
-                fixed_vertex = 0
-                free_vertices = list(range(1, n_vertices))
-                
-                L_free = L[free_vertices][:, free_vertices]
-                b_free = b[free_vertices, dim]
-                
-                # 减去固定顶点的贡献
-                L_fixed_contrib = L[free_vertices, fixed_vertex].toarray().flatten()
-                b_free -= L_fixed_contrib * uv_coords[fixed_vertex, dim]
-                
-                uv_free = spsolve(L_free, b_free)
-                new_uv_coords[free_vertices, dim] = uv_free
-                
-            except Exception as e2:
-                print(f"简化求解也失败: {e2}")
-                continue
+            free_vertices = list(range(1, n_vertices))
+            L_free = L[free_vertices][:, free_vertices]
+            b_free = b[free_vertices, dim]
+            
+            # 减去固定顶点贡献
+            L_fixed = L[free_vertices, 0].toarray().flatten()
+            b_free -= L_fixed * uv_coords[0, dim]
+            
+            # 直接求解
+            uv_free = spsolve(L_free, b_free)
+            new_uv_coords[free_vertices, dim] = uv_free
+        except:
+            continue
     
     return new_uv_coords
 
 def _normalize_uv_coordinates(uv_coords):
     """更稳健的UV坐标归一化"""
-    # 移除异常值
-    uv_coords = np.clip(uv_coords, -100, 100)
+    uv_coords = np.clip(uv_coords, -50, 50)
     
-    # 计算有效范围（排除异常值）
-    percentile_low = np.percentile(uv_coords, 5, axis=0)
-    percentile_high = np.percentile(uv_coords, 95, axis=0)
+    # 计算更稳健的范围
+    center = np.median(uv_coords, axis=0)  # 使用中位数而非均值
+    centered_coords = uv_coords - center
     
-    # 使用百分位数进行归一化
-    uv_range = percentile_high - percentile_low
-    uv_range = np.where(uv_range < 1e-6, 1, uv_range)
+    # 使用MAD (Median Absolute Deviation) 而不是标准差
+    mad = np.median(np.abs(centered_coords), axis=0)
+    mad = np.where(mad < 1e-6, 1, mad)
     
-    normalized_uv = (uv_coords - percentile_low) / uv_range
+    # 更温和的缩放
+    scale_factor = np.maximum(mad * 3, np.max(np.abs(centered_coords), axis=0))
+    normalized_uv = centered_coords / scale_factor
     
-    # 确保在[0,1]范围内
-    normalized_uv = np.clip(normalized_uv, 0, 1)
+    # 移到[0,1]范围但保持更多的分散性
+    normalized_uv = (normalized_uv + 1) * 0.4 + 0.1  # 映射到[0.1, 0.9]
     
-    return normalized_uv
+    return np.clip(normalized_uv, 0, 1)
 
-def uv_parameterization(vertices, faces, max_iterations=100, tolerance=1e-6):
-    """
-    改进的闭合mesh ARAP参数化
-    """
-    n_vertices = len(vertices)
-    n_faces = len(faces)
+
+import numpy as np
+import scipy.sparse as sp
+from scipy.sparse.linalg import spsolve
+
+
+class RobustSLIMUV:
+    def __init__(self, vertices, faces):
+        """
+        简化的SLIM UV参数化器
+
+        Args:
+            vertices: numpy array (N, 3) - 3D顶点坐标
+            faces: numpy array (M, 3) - 面片顶点索引
+        """
+        self.V = np.array(vertices, dtype=np.float64)
+        self.F = np.array(faces, dtype=np.int32)
+        self.n_vertices = len(self.V)
+        self.n_faces = len(self.F)
+
+        # 初始化UV坐标
+        self.UV = np.zeros((self.n_vertices, 2))
+
+        # SLIM参数
+        self.max_iterations = 10
+        self.convergence_threshold = 1e-6
+        self.regularization = 1e-8  # 正则化参数，防止数值不稳定
+
+        # 预计算每个面片的局部坐标系和面积
+        self._precompute_face_data()
+
+    def _precompute_face_data(self):
+        """预计算每个三角面片的局部2D坐标系和面积"""
+        self.face_areas_3d = np.zeros(self.n_faces)
+        self.face_local_coords = np.zeros((self.n_faces, 3, 2))
+
+        for i, face in enumerate(self.F):
+            v0, v1, v2 = self.V[face[0]], self.V[face[1]], self.V[face[2]]
+
+            e1 = v1 - v0
+            e2 = v2 - v0
+
+            # 计算面积
+            area_vec = np.cross(e1, e2)
+            area = 0.5 * np.linalg.norm(area_vec)
+            self.face_areas_3d[i] = area
+
+            # 跳过退化三角形
+            if area < 1e-12:
+                continue
+
+            # 构建局部坐标系，保持几何距离和角度
+            e1_len = np.linalg.norm(e1)
+            if e1_len < 1e-12:
+                continue
+
+            u_axis = e1 / e1_len
+            normal = area_vec / (2.0 * area)
+            v_axis = np.cross(normal, u_axis)
+
+            # 计算局部2D坐标，保持原始距离
+            self.face_local_coords[i, 0] = [0, 0]
+            self.face_local_coords[i, 1] = [e1_len, 0]
+            self.face_local_coords[i, 2] = [np.dot(e2, u_axis), np.dot(e2, v_axis)]
+
+    def initialize_uv_pca(self):
+        """使用PCA进行UV初始化，保持几何结构"""
+        # 中心化顶点
+        centered = self.V - np.mean(self.V, axis=0)
+
+        # 计算协方差矩阵
+        cov_matrix = centered.T @ centered / (self.n_vertices - 1)
+
+        # 特征值分解，选择最大的两个主成分
+        eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
+
+        # 按特征值排序（降序）
+        sorted_indices = np.argsort(eigenvalues)[::-1]
+        principal_axes = eigenvectors[:, sorted_indices[:2]]
+
+        # 投影到主平面
+        self.UV = centered @ principal_axes
+
+        # 归一化到[0,1]范围，但保持长宽比
+        uv_min = np.min(self.UV, axis=0)
+        uv_max = np.max(self.UV, axis=0)
+        uv_range = uv_max - uv_min
+
+        # 防止除零
+        uv_range = np.maximum(uv_range, 1e-8)
+
+        # 标准化到[0,1]
+        self.UV = (self.UV - uv_min) / uv_range
+
+        # 将UV坐标移动到[0.1, 0.9]范围内，避免边界问题
+        self.UV = 0.05 + 0.9 * self.UV
+
+    def compute_slim_energy(self):
+        """计算SLIM能量，增加数值稳定性检查"""
+        total_energy = 0.0
+        valid_faces = 0
+
+        for i, face in enumerate(self.F):
+            if self.face_areas_3d[i] < 1e-12:
+                continue
+
+            p0, p1, p2 = self.face_local_coords[i]
+            u0, u1, u2 = self.UV[face]
+
+            # 检查UV坐标是否有效
+            if np.any(np.isnan(self.UV[face])) or np.any(np.isinf(self.UV[face])):
+                continue
+
+            Ds = np.column_stack([p1 - p0, p2 - p0])
+            Dm = np.column_stack([u1 - u0, u2 - u0])
+
+            try:
+                # 添加正则化以避免奇异矩阵
+                Ds_reg = Ds + self.regularization * np.eye(2)
+                Ds_inv = np.linalg.inv(Ds_reg)
+                J = Dm @ Ds_inv
+
+                # 计算奇异值
+                s = np.linalg.svd(J, compute_uv=False)
+                s = np.maximum(s, 1e-8)  # 防止奇异值过小
+                s = np.minimum(s, 1e8)  # 防止奇异值过大
+
+                # SLIM能量：对称狄利克雷能量
+                energy = np.sum(s ** 2 + 1.0 / (s ** 2))
+
+                if np.isfinite(energy):
+                    total_energy += energy * self.face_areas_3d[i]
+                    valid_faces += 1
+
+            except (np.linalg.LinAlgError, ZeroDivisionError):
+                # 对问题面片施加惩罚
+                total_energy += 1e6
+
+        return total_energy / max(valid_faces, 1)
+
+    def optimize_slim(self):
+        """SLIM优化主循环，增强数值稳定性"""
+        self.initialize_uv_pca()
+
+        prev_energy = self.compute_slim_energy()
+        print(f"初始能量 = {prev_energy:.6f}")
+
+        for iteration in range(self.max_iterations):
+            # 备份当前UV坐标
+            uv_backup = self.UV.copy()
+
+            try:
+                self._solve_slim_step()
+
+                # 检查是否产生了NaN或无穷大
+                if np.any(np.isnan(self.UV)) or np.any(np.isinf(self.UV)):
+                    print(f"迭代 {iteration + 1}: 检测到数值不稳定，恢复到上一步")
+                    self.UV = uv_backup
+                    self.regularization *= 10  # 增加正则化
+                    continue
+
+                current_energy = self.compute_slim_energy()
+
+                # # 如果能量增加太多，回退
+                # if current_energy > prev_energy * 20:
+                #     print(f"迭代 {iteration + 1}: 能量增加过大，恢复到上一步")
+                #     self.UV = uv_backup
+                #     self.regularization *= 2
+                #     continue
+                #
+                print(f"迭代 {iteration + 1}: 能量 = {current_energy:.6f}")
+                #
+                # 收敛检查
+                if abs(prev_energy - current_energy) / (prev_energy + 1e-8) < self.convergence_threshold:
+                    print(f"在 {iteration + 1} 次迭代后收敛")
+                    break
+
+                prev_energy = current_energy
+
+            except Exception as e:
+                print(f"迭代 {iteration + 1} 出错: {e}，恢复到上一步")
+                self.UV = uv_backup
+                self.regularization *= 10
+
+        print("SLIM 优化完成")
+
+    def _solve_slim_step(self):
+        """执行一步SLIM优化，增强数值稳定性"""
+        n = self.n_vertices
+        A = sp.lil_matrix((2 * n, 2 * n))
+        b = np.zeros(2 * n)
+
+        # 添加小的正则化到对角线
+        for i in range(2 * n):
+            A[i, i] += self.regularization
+
+        # 对每个面片，计算其对全局系统的贡献
+        for i, face in enumerate(self.F):
+            if self.face_areas_3d[i] < 1e-12:
+                continue
+            try:
+                self._add_slim_terms(i, face, A, b)
+            except Exception as e:
+                print(f"面片 {i} 处理失败: {e}")
+                continue
+
+        # 求解线性系统
+        A = A.tocsr()
+        try:
+            # 使用更稳定的求解器
+            solution = spsolve(A, b)
+
+            # 检查解的有效性
+            if np.any(np.isnan(solution)) or np.any(np.isinf(solution)):
+                raise ValueError("求解得到无效结果")
+
+            self.UV[:, 0] = solution[:n]
+            self.UV[:, 1] = solution[n:]
+
+        except Exception as e:
+            print(f"线性系统求解失败: {e}")
+            raise
+
+    def _add_slim_terms(self, face_idx, face, A, b):
+        """为单个面片添加SLIM能量项到线性系统"""
+        n = self.n_vertices
+        v_indices = face
+
+        # 检查面片有效性
+        if self.face_areas_3d[face_idx] < 1e-12:
+            return
+
+        # 局部步骤: 计算理想旋转
+        p0, p1, p2 = self.face_local_coords[face_idx]
+        u0, u1, u2 = self.UV[v_indices]
+
+        Ds = np.column_stack([p1 - p0, p2 - p0])
+        Dm = np.column_stack([u1 - u0, u2 - u0])
+
+        try:
+            # 添加正则化
+            Ds_reg = Ds + self.regularization * np.eye(2)
+            Ds_inv = np.linalg.inv(Ds_reg)
+            J = Dm @ Ds_inv
+
+            # SVD分解求理想旋转
+            U, s, Vt = np.linalg.svd(J)
+
+            # 限制奇异值范围，避免极端变形
+            s = np.clip(s, 0.1, 10.0)
+
+            R = U @ Vt  # 理想旋转矩阵
+
+            # 确保是纯旋转 (det > 0)
+            if np.linalg.det(R) < 0:
+                U[:, -1] *= -1
+                R = U @ Vt
+
+        except np.linalg.LinAlgError:
+            R = np.eye(2)  # 使用单位矩阵作为fallback
+
+        # 全局步骤: 构建线性系统贡献
+        area_weight = self.face_areas_3d[face_idx]
+
+        # 简化的余切权重计算
+        for i in range(3):
+            for j in range(i + 1, 3):
+                vi, vj = v_indices[i], v_indices[j]
+
+                # 基于面积的权重
+                w = area_weight
+
+                # 拉普拉斯项
+                A[vi, vi] += w
+                A[vj, vj] += w
+                A[vi, vj] -= w
+                A[vj, vi] -= w
+
+                A[n + vi, n + vi] += w
+                A[n + vj, n + vj] += w
+                A[n + vi, n + vj] -= w
+                A[n + vj, n + vi] -= w
+
+                # 右手边项：目标变形
+                p_diff = self.face_local_coords[face_idx, i] - self.face_local_coords[face_idx, j]
+                target_uv_diff = R @ p_diff
+
+                b_contrib_u = w * target_uv_diff[0]
+                b_contrib_v = w * target_uv_diff[1]
+
+                b[vi] += b_contrib_u
+                b[vj] -= b_contrib_u
+
+                b[n + vi] += b_contrib_v
+                b[n + vj] -= b_contrib_v
+
+    def get_uv_coordinates(self):
+        """返回最终的UV坐标"""
+        return self.UV.copy()
     
-    print(f"开始闭合mesh ARAP参数化，顶点数: {n_vertices}, 面数: {n_faces}")
+# def uv_parameterization(vertices, faces, max_iterations=100, tolerance=1e-6):
+#     """
+#     改进的闭合mesh ARAP参数化
+#     """
+#     n_vertices = len(vertices)
+#     n_faces = len(faces)
     
-    # 1. 改进的初始化
-    print("步骤1: 立体投影初始化...")
-    uv_coords = _initialize_closed_mesh_conformal(vertices, faces)
+#     print(f"开始闭合mesh ARAP参数化，顶点数: {n_vertices}, 面数: {n_faces}")
     
-    # 2. 构建拉普拉斯矩阵
-    print("步骤2: 构建拉普拉斯矩阵...")
-    L, face_areas = _build_laplacian_matrix(vertices, faces)
+#     # 1. 改进的初始化
+#     print("步骤1: 立体投影初始化...")
+#     uv_coords = _initialize_conformal(vertices, faces)
     
-    # 3. ARAP迭代优化
-    print("步骤3: ARAP迭代优化...")
-    for iteration in range(max_iterations):
-        uv_coords_old = uv_coords.copy()
+#     # 2. 构建拉普拉斯矩阵
+#     print("步骤2: 构建拉普拉斯矩阵...")
+#     L, face_areas = _build_laplacian_matrix(vertices, faces)
+    
+#     # 3. ARAP迭代优化
+#     print("步骤3: ARAP迭代优化...")
+#     for iteration in range(max_iterations):
+#         uv_coords_old = uv_coords.copy()
         
-        # 3a. 计算最优旋转
-        rotations = _compute_optimal_rotations(vertices, faces, uv_coords, face_areas)
+#         # 3a. 计算最优旋转
+#         rotations = _compute_optimal_rotations(vertices, faces, uv_coords, face_areas)
         
-        # 3b. 全局步骤
-        uv_coords = _solve_global_step_closed_mesh(L, faces, rotations, face_areas, vertices, uv_coords)
+#         # 3b. 全局步骤
+#         uv_coords = _solve_global_step(L, faces, rotations, face_areas, vertices, uv_coords)
         
-        # 检查收敛
-        diff = np.linalg.norm(uv_coords - uv_coords_old)
-        if iteration % 10 == 0:
-            print(f"迭代 {iteration+1}: 误差 = {diff:.2e}")
+#         # 检查收敛
+#         diff = np.linalg.norm(uv_coords - uv_coords_old)
+#         if iteration % 10 == 0:
+#             print(f"迭代 {iteration+1}: 误差 = {diff:.2e}")
             
-        if diff < tolerance:
-            print(f"ARAP收敛于第{iteration+1}次迭代")
-            break
+#         if diff < tolerance:
+#             print(f"ARAP收敛于第{iteration+1}次迭代")
+#             break
     
-    # 4. 最终归一化
-    print("步骤4: 最终归一化...")
-    uv_coords = _normalize_uv_coordinates(uv_coords)
+#     # 4. 最终归一化
+#     print("步骤4: 最终归一化...")
+#     uv_coords = _normalize_uv_coordinates(uv_coords)
     
-    return uv_coords
+#     return uv_coords
 
-def process_point_cloud(pcd, output_dir, ball_radius=0.03, visualization=False):
+
+
+def process_point_cloud(pcd, output_dir, image_size = None, ball_radius=0.03, visualization=False):
     """
     读取点云，进行Ball Pivoting重建，然后用UV参数化进行展开
     
@@ -442,44 +748,28 @@ def process_point_cloud(pcd, output_dir, ball_radius=0.03, visualization=False):
     if visualization:
         print("可视化点云")
         o3d.visualization.draw_geometries([pcd])
-    while not is_watertight:
-        count += 1
+    if image_size < 200:
+        # 使用Open3D的Alpha Shape进行三角化重建
+        print("使用Alpha Shape进行三角化重建...")
+        mesh = alpha_shape_3d(pcd, alpha=5)
+        vertices = np.asarray(mesh.vertices)
+        faces = np.asarray(mesh.triangles)
+        tri_mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
+        tri_mesh.fill_holes()
+
+        
+    else:
         print(f"使用Ball Pivoting进行表面重建, 球半径 = {ball_radius}...")
         radii = [ball_radius, ball_radius * 2, ball_radius * 4]  # 多尺度重建
         mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
             pcd, o3d.utility.DoubleVector(radii))
-
-        # 转换为trimesh格式，方便进行UV展开
         vertices = np.asarray(mesh.vertices)
         faces = np.asarray(mesh.triangles)
         tri_mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
         tri_mesh.remove_degenerate_faces()
         tri_mesh.remove_duplicate_faces()
         tri_mesh.fill_holes()
-    
-        is_watertight = tri_mesh.is_watertight
-
-        print(f"网格是否封闭: {is_watertight}")
-        if count > 1:
-            # 使用Open3D的Alpha Shape进行三角化重建
-            print("使用Alpha Shape进行三角化重建...")
-            mesh = alpha_shape_3d(pcd, alpha = 0.18)
-            # tetra_mesh, pt_map = o3d.geometry.TetraMesh.create_from_point_cloud(pcd)
-            # mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(
-            #     pcd, ball_radius, tetra_mesh, pt_map
-            # )
-            print(np.asarray(pcd.points), np.asarray(mesh.vertices))
-            # mesh.remove_duplicated_triangles()
-            # mesh.remove_degenerate_triangles()
-            # mesh.remove_duplicated_vertices()
-            # mesh.remove_non_manifold_edges()
-
-            # 转换为trimesh格式，方便进行UV展开
-            vertices = np.asarray(mesh.vertices)
-            faces = np.asarray(mesh.triangles)
-            tri_mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
-            tri_mesh.fill_holes()
-            is_watertight = tri_mesh.is_watertight
+        
 
 
     # 可视化重建结果
@@ -496,8 +786,10 @@ def process_point_cloud(pcd, output_dir, ball_radius=0.03, visualization=False):
     print("开始ARAP UV参数化...")
     vertices = tri_mesh.vertices
     faces = tri_mesh.faces
-    
-    uv_coords = uv_parameterization(vertices, faces)
+    slim = RobustSLIMUV(vertices, faces)
+    slim.optimize_slim()
+    # uv_coords = uv_parameterization(vertices, faces)
+    uv_coords = slim.get_uv_coordinates()
     
     print(f"UV参数化完成，生成 {len(uv_coords)} 个UV坐标")
     return {
