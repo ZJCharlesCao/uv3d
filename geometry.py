@@ -21,7 +21,7 @@ from collections import Counter
 from sklearn.decomposition import PCA
 from typing import List, Tuple, Optional, Set
 from sklearn.neighbors import NearestNeighbors
-
+import cv2
 
 
 def compute_circumsphere_radius(tetra_points):
@@ -800,139 +800,202 @@ def process_point_cloud(pcd, output_dir, image_size = None, ball_radius=0.03, vi
     }
 
 
-def create_uv_rgb_grid(vertices, uv_coords, image_size=512, output_path="uv_rgb_texture.png", output_metadata=None):
-    """
-    直接生成UV RGB图像，将3D顶点的XYZ坐标映射到UV空间的RGB通道
-    图像尺寸由UV坐标分布自动决定，确保所有像素都能铺开
+# def create_uv_rgb_grid(vertices, uv_coords, image_size=512, output_path="uv_rgb_texture.png", output_metadata=None):
+#     """
+#     直接生成UV RGB图像，将3D顶点的XYZ坐标映射到UV空间的RGB通道
+#     图像尺寸由UV坐标分布自动决定，确保所有像素都能铺开
     
-    参数:
-    - vertices: 3D顶点坐标 (N, 3)
-    - uv_coords: UV坐标 (N, 2)
-    - min_image_size: 最小图像尺寸
-    - output_path: 保存路径
-    """
+#     参数:
+#     - vertices: 3D顶点坐标 (N, 3)
+#     - uv_coords: UV坐标 (N, 2)
+#     - min_image_size: 最小图像尺寸
+#     - output_path: 保存路径
+#     """
     
-    # 如果uv_coords是列表，取第一个元素
-    if isinstance(uv_coords, list):
-        uv_coords = uv_coords[0]
+#     # 如果uv_coords是列表，取第一个元素
+#     if isinstance(uv_coords, list):
+#         uv_coords = uv_coords[0]
     
-    # 归一化XYZ坐标到[0,1]范围
-    x_min, x_max = vertices[:, 0].min(), vertices[:, 0].max()
-    y_min, y_max = vertices[:, 1].min(), vertices[:, 1].max()
-    z_min, z_max = vertices[:, 2].min(), vertices[:, 2].max()
+#     # 归一化XYZ坐标到[0,1]范围
+#     x_min, x_max = vertices[:, 0].min(), vertices[:, 0].max()
+#     y_min, y_max = vertices[:, 1].min(), vertices[:, 1].max()
+#     z_min, z_max = vertices[:, 2].min(), vertices[:, 2].max()
     
-    r = (vertices[:, 0] - x_min) / (x_max - x_min) if x_max != x_min else np.zeros_like(vertices[:, 0])
-    g = (vertices[:, 1] - y_min) / (y_max - y_min) if y_max != y_min else np.zeros_like(vertices[:, 1])
-    b = (vertices[:, 2] - z_min) / (z_max - z_min) if z_max != z_min else np.zeros_like(vertices[:, 2])
+#     r = (vertices[:, 0] - x_min) / (x_max - x_min) if x_max != x_min else np.zeros_like(vertices[:, 0])
+#     g = (vertices[:, 1] - y_min) / (y_max - y_min) if y_max != y_min else np.zeros_like(vertices[:, 1])
+#     b = (vertices[:, 2] - z_min) / (z_max - z_min) if z_max != z_min else np.zeros_like(vertices[:, 2])
     
-    # 将RGB值转换到[0,255]范围
-    rgb_colors = np.stack([r, g, b], axis=1) * 255
-    rgb_colors = rgb_colors.astype(np.uint8)
+#     # 将RGB值转换到[0,255]范围
+#     rgb_colors = np.stack([r, g, b], axis=1) * 255
+#     rgb_colors = rgb_colors.astype(np.uint8)
     
-    # 归一化UV坐标到[0,1]范围
-    u_min, u_max = uv_coords[:, 0].min(), uv_coords[:, 0].max()
-    v_min, v_max = uv_coords[:, 1].min(), uv_coords[:, 1].max()
+#     # 归一化UV坐标到[0,1]范围
+#     u_min, u_max = uv_coords[:, 0].min(), uv_coords[:, 0].max()
+#     v_min, v_max = uv_coords[:, 1].min(), uv_coords[:, 1].max()
     
-    u_normalized = (uv_coords[:, 0] - u_min) / (u_max - u_min) if u_max != u_min else np.zeros_like(uv_coords[:, 0])
-    v_normalized = (uv_coords[:, 1] - v_min) / (v_max - v_min) if v_max != v_min else np.zeros_like(uv_coords[:, 1])
+#     u_normalized = (uv_coords[:, 0] - u_min) / (u_max - u_min) if u_max != u_min else np.zeros_like(uv_coords[:, 0])
+#     v_normalized = (uv_coords[:, 1] - v_min) / (v_max - v_min) if v_max != v_min else np.zeros_like(uv_coords[:, 1])
     
     
-    # 使用最佳尺寸转换像素坐标
-    pixel_x = (u_normalized * (image_size - 1)).astype(np.int32)
-    pixel_y = ((1 - v_normalized) * (image_size - 1)).astype(np.int32)
+#     # 使用最佳尺寸转换像素坐标
+#     pixel_x = (u_normalized * (image_size - 1)).astype(np.int32)
+#     pixel_y = ((1 - v_normalized) * (image_size - 1)).astype(np.int32)
     
-    # 验证重叠情况
-    pixel_coords = np.stack([pixel_x, pixel_y], axis=1)
-    unique_coords, counts = np.unique(pixel_coords, axis=0, return_counts=True)
-    num_repeated = np.sum(counts > 1)
-    print(f"有 {num_repeated} 个像素坐标有重复（被多个顶点映射）")
+#     # 验证重叠情况
+#     pixel_coords = np.stack([pixel_x, pixel_y], axis=1)
+#     unique_coords, counts = np.unique(pixel_coords, axis=0, return_counts=True)
+#     num_repeated = np.sum(counts > 1)
+#     print(f"有 {num_repeated} 个像素坐标有重复（被多个顶点映射）")
     
-    # 创建空白图像
-    rgb_image = np.ones((image_size, image_size, 3), dtype=np.uint8) * 255
+#     # 创建空白图像
+#     rgb_image = np.ones((image_size, image_size, 3), dtype=np.uint8) * 255
 
-    # 直接填充顶点像素（避免重复填充，记录已填充位置）
-    grid_map = np.zeros((image_size, image_size), dtype=np.int32)
-    processed_indices = []
-    grid_vertices = []
-    overflow_vertices = []
+#     # 直接填充顶点像素（避免重复填充，记录已填充位置）
+#     grid_map = np.zeros((image_size, image_size), dtype=np.int32)
+#     processed_indices = []
+#     grid_vertices = []
+#     overflow_vertices = []
 
-    for i, (x, y) in enumerate(zip(pixel_x, pixel_y)):
-        if 0 <= x < image_size and 0 <= y < image_size:
-            if grid_map[x, y] == 0:  # 该像素未被占用
-                grid_map[x, y] = i + 1  # 存储顶点索引+1（避免0）
-                rgb_image[y, x] = rgb_colors[i]
-                grid_vertices.append(vertices[i])
+#     for i, (x, y) in enumerate(zip(pixel_x, pixel_y)):
+#         if 0 <= x < image_size and 0 <= y < image_size:
+#             if grid_map[x, y] == 0:  # 该像素未被占用
+#                 grid_map[x, y] = i + 1  # 存储顶点索引+1（避免0）
+#                 rgb_image[y, x] = rgb_colors[i]
+#                 grid_vertices.append(vertices[i])
+#             else:
+#                 # 该像素已被占用，产生重复
+#                 overflow_vertices.append(vertices[i])
+#         else:
+#             # 坐标超出网格范围
+#             overflow_vertices.append(vertices[i])
+    
+#     # 统计非空白像素数量
+#     non_white_pixels = np.sum(np.any(rgb_image != 255, axis=2))
+
+#     print(f"非空白像素数量: {non_white_pixels}")
+#     print(f"总顶点数量: {len(vertices)}")
+#     print(f"像素利用率: {non_white_pixels/len(vertices)*100:.2f}%")
+#     metadata = {
+#         'x_min': float(vertices[:, 0].min()),
+#         'x_max': float(vertices[:, 0].max()),
+#         'y_min': float(vertices[:, 1].min()),
+#         'y_max': float(vertices[:, 1].max()),
+#         'z_min': float(vertices[:, 2].min()),
+#         'z_max': float(vertices[:, 2].max()),
+#         'u_min': float(uv_coords[:, 0].min()),
+#         'u_max': float(uv_coords[:, 0].max()),
+#         'v_min': float(uv_coords[:, 1].min()),
+#         'v_max': float(uv_coords[:, 1].max()),
+#         'original_vertex_count': len(vertices),
+#         'size': image_size  # 假设使用默认尺寸
+#     }
+
+#     import json
+
+#     with open(output_metadata, 'w') as f:
+#         json.dump(metadata, f, indent=2)
+
+#     # 确保图像格式正确
+#     if rgb_image.ndim == 3 and rgb_image.shape[2] == 3:
+#         # 保存图像到本地
+#         pil_image = Image.fromarray(rgb_image, mode='RGB')
+#         pil_image.save(output_path)
+#         print(f"UV RGB纹理图像已保存到: {output_path}")
+#     else:
+#         print(f"错误：图像数据格式不正确，形状为 {rgb_image.shape}")
+
+#     return grid_vertices,  overflow_vertices
+
+
+import json
+import os
+import numpy as np
+import cv2
+
+
+def create_attribute_rgb_layers(vertices, uv_coords, attributes, image_size, output_dir, layer_count):
+    """
+    将多维属性映射到RGB图像，使用分组归一化策略
+    """
+
+    # 转换到像素坐标
+    pixel_x = (uv_coords[:, 0] * (image_size - 1)).astype(np.int32)
+    pixel_y = ((1 - uv_coords[:, 1]) * (image_size - 1)).astype(np.int32)
+
+    # 检查边界
+    valid_mask = (pixel_x >= 0) & (pixel_x < image_size) & (pixel_y >= 0) & (pixel_y < image_size)
+    pixel_x = pixel_x[valid_mask]
+    pixel_y = pixel_y[valid_mask]
+    valid_attributes = attributes[valid_mask]
+
+    print(f"有效像素点数量: {len(pixel_x)}")
+
+    num_attr = valid_attributes.shape[1]
+
+    # 定义分组
+    group1_end = min(3, num_attr)
+    group2_end = min(51, num_attr)
+
+    # 计算各组归一化参数
+    norm_params = {"layer": layer_count, "groups": {}}
+
+    if group1_end > 0:
+        g1_data = valid_attributes[:, 0:group1_end]
+        norm_params["groups"]["group1"] = {"min": float(g1_data.min()), "max": float(g1_data.max())}
+
+    if group2_end > group1_end:
+        g2_data = valid_attributes[:, group1_end:group2_end]
+        norm_params["groups"]["group2"] = {"min": float(g2_data.min()), "max": float(g2_data.max())}
+
+    if num_attr > group2_end:
+        g3_data = valid_attributes[:, group2_end:]
+        norm_params["groups"]["group3"] = {"min": float(g3_data.min()), "max": float(g3_data.max())}
+
+    def normalize_data(data, min_val, max_val):
+        if max_val != min_val:
+            return ((data - min_val) / (max_val - min_val) * 255).astype(np.uint8)
+        return np.zeros_like(data, dtype=np.uint8)
+
+    # 生成RGB图像
+    for i in range(0, num_attr, 3):
+        img = np.ones((image_size, image_size, 3), dtype=np.uint8) * 255
+        grid_map = np.zeros((image_size, image_size), dtype=bool)
+
+        # 处理RGB三个通道
+        current_channels = []
+        for c in range(3):
+            if i + c < num_attr:
+                attr_idx = i + c
+                channel_data = valid_attributes[:, attr_idx]
+
+                # 选择归一化参数
+                if attr_idx < group1_end:
+                    min_val, max_val = norm_params["groups"]["group1"]["min"], norm_params["groups"]["group1"]["max"]
+                elif attr_idx < group2_end:
+                    min_val, max_val = norm_params["groups"]["group2"]["min"], norm_params["groups"]["group2"]["max"]
+                else:
+                    min_val, max_val = norm_params["groups"]["group3"]["min"], norm_params["groups"]["group3"]["max"]
+
+                current_channels.append(normalize_data(channel_data, min_val, max_val))
             else:
-                # 该像素已被占用，产生重复
-                overflow_vertices.append(vertices[i])
-        else:
-            # 坐标超出网格范围
-            overflow_vertices.append(vertices[i])
-    
-    # 统计非空白像素数量
-    non_white_pixels = np.sum(np.any(rgb_image != 255, axis=2))
+                current_channels.append(np.full(len(pixel_x), 255, dtype=np.uint8))
 
-    print(f"非空白像素数量: {non_white_pixels}")
-    print(f"总顶点数量: {len(vertices)}")
-    print(f"像素利用率: {non_white_pixels/len(vertices)*100:.2f}%")
-    metadata = {
-        'x_min': float(vertices[:, 0].min()),
-        'x_max': float(vertices[:, 0].max()),
-        'y_min': float(vertices[:, 1].min()),
-        'y_max': float(vertices[:, 1].max()),
-        'z_min': float(vertices[:, 2].min()),
-        'z_max': float(vertices[:, 2].max()),
-        'u_min': float(uv_coords[:, 0].min()),
-        'u_max': float(uv_coords[:, 0].max()),
-        'v_min': float(uv_coords[:, 1].min()),
-        'v_max': float(uv_coords[:, 1].max()),
-        'original_vertex_count': len(vertices),
-        'size': image_size  # 假设使用默认尺寸
-    }
+        # 填充像素
+        filled_count = 0
+        for j, (x, y) in enumerate(zip(pixel_x, pixel_y)):
+            if not grid_map[y, x]:
+                grid_map[y, x] = True
+                img[y, x] = [current_channels[0][j], current_channels[1][j], current_channels[2][j]]
+                filled_count += 1
 
-    import json
+        # 保存图片
+        output_path = os.path.join(output_dir, f"layer_{layer_count}_{i // 3}.png")
+        cv2.imwrite(output_path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_PNG_COMPRESSION, 6])
 
-    with open(output_metadata, 'w') as f:
-        json.dump(metadata, f, indent=2)
+        # print(f"图像 {i // 3}: 填充像素数 {filled_count}")
 
-    # 确保图像格式正确
-    if rgb_image.ndim == 3 and rgb_image.shape[2] == 3:
-        # 保存图像到本地
-        pil_image = Image.fromarray(rgb_image, mode='RGB')
-        pil_image.save(output_path)
-        print(f"UV RGB纹理图像已保存到: {output_path}")
-    else:
-        print(f"错误：图像数据格式不正确，形状为 {rgb_image.shape}")
+    # 保存归一化参数
+    json_path = os.path.join(output_dir, f"layer_{layer_count}_norm_params.json")
+    with open(json_path, 'w') as f:
+        json.dump(norm_params, f, indent=2)
 
-    return grid_vertices,  overflow_vertices
-    
-
-    
-
-# if __name__ == "__main__":
-#     parser = argparse.ArgumentParser(description="点云重建和LSCM UV展开工具")
-#     parser.add_argument("--output", "-o", default="output", help="输出目录")
-#     parser.add_argument("--radius", "-r", type=float, default=0.005, help="Ball Pivoting球半径")
-#     parser.add_argument("--visualize", "-v", action="store_true", help="是否显示3D可视化结果")
-    
-#     args = parser.parse_args()
-    
-#     # 创建输出目录
-#     if not os.path.exists(args.output):
-#         os.makedirs(args.output)
-    
-#     # 使用bunny数据集作为示例
-#     bunny = o3d.data.BunnyMesh()
-#     gt_mesh = o3d.io.read_triangle_mesh(bunny.path)
-#     gt_mesh.compute_vertex_normals()
-#     pcd = gt_mesh.sample_points_poisson_disk(3000)
-#     start_time = time.time()
-#     results = process_point_cloud(pcd, args.output, args.radius, args.visualize)
-#     point = results["vertices"]
-#     uv_coords = results["uv_coords"]
-#     faces = results["faces"]
-
-
-#     create_uv_rgb_grid(point, uv_coords, output_path=os.path.join(args.output, "uv_rgb_texture.png"))
-
-#     print(f"总处理时间: {time.time() - start_time:.2f} 秒")
